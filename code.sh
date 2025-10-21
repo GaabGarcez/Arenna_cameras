@@ -6,3 +6,10 @@ sudo apt install -y \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
   libatlas3-base
+
+
+
+# baixar e rodar o tunnel efêmero
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64.deb -o cloudflared.deb
+sudo dpkg -i cloudflared.deb || sudo apt -f install -y
+cloudflared tunnel --url http://localhost:8000
