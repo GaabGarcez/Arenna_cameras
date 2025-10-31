@@ -4,11 +4,14 @@
 # - Conectar -> inicia threads RTSP e abre tela com ARENNA no topo e layouts (row, 2x2 das 4 primeiras, 4x4 todas)
 # - Streams servidos como MJPEG (compatível com desktop e celular na mesma LAN)
 
-import os, time, threading, urllib.parse, atexit, socket, math
+import os, time, threading, urllib.parse, atexit, socket, math, json
 from datetime import datetime
 from typing import Tuple, Dict, List
+from collections import deque
 import cv2, numpy as np
-from flask import Flask, Response, render_template_string, request, redirect, url_for
+import requests
+from requests.auth import HTTPDigestAuth
+from flask import Flask, Response, render_template_string, request, redirect, url_for, jsonify
 
 # ==========================
 # Utilidades
@@ -34,6 +37,89 @@ def make_rtsp_url(ip, user, password, channel, subtype):
     pwd_enc  = urllib.parse.quote(password, safe="")
     # Intelbras/Dahua: /cam/realmonitor?channel=N&subtype=0|1
     return f"rtsp://{user_enc}:{pwd_enc}@{ip}:554/cam/realmonitor?channel={channel}&subtype={subtype}"
+
+# ==========================
+# Listener de eventos de detecção facial
+# ==========================
+class FaceDetectionListener(threading.Thread):
+    """Escuta eventos de detecção facial do DVR via HTTP API."""
+    def __init__(self, ip, user, password, max_logs=100):
+        super().__init__(name="FaceDetectionListener", daemon=True)
+        self.ip = ip
+        self.user = user
+        self.password = password
+        self.max_logs = max_logs
+        self.logs = deque(maxlen=max_logs)
+        self.stop_flag = False
+        self.connected = False
+        self.lock = threading.Lock()
+
+    def run(self):
+        """Loop principal que escuta eventos do DVR."""
+        while not self.stop_flag:
+            try:
+                # URL da API de eventos Dahua/Intelbras
+                # Eventos: FaceDetection (detecção), FaceRecognition (reconhecimento)
+                url = f"http://{self.ip}/cgi-bin/eventManager.cgi?action=attach&codes=[FaceDetection,FaceRecognition]&heartbeat=5"
+
+                # Conecta com autenticação digest (padrão Dahua/Intelbras)
+                auth = HTTPDigestAuth(self.user, self.password)
+
+                with requests.get(url, auth=auth, stream=True, timeout=30) as response:
+                    if response.status_code == 200:
+                        self.connected = True
+                        # Lê o stream de eventos linha por linha
+                        for line in response.iter_lines(decode_unicode=True):
+                            if self.stop_flag:
+                                break
+
+                            if line and line.startswith("Code="):
+                                # Parseia o evento
+                                event = self._parse_event(line)
+                                if event:
+                                    with self.lock:
+                                        self.logs.append(event)
+                    else:
+                        self.connected = False
+                        time.sleep(5)  # Aguarda antes de reconectar
+
+            except requests.exceptions.RequestException:
+                self.connected = False
+                time.sleep(5)  # Aguarda antes de reconectar
+            except Exception:
+                self.connected = False
+                time.sleep(5)
+
+    def _parse_event(self, line):
+        """Parseia uma linha de evento do DVR."""
+        try:
+            # Formato: Code=FaceDetection;action=Start;index=0;...
+            event_data = {}
+            for item in line.split(';'):
+                if '=' in item:
+                    key, value = item.split('=', 1)
+                    event_data[key] = value
+
+            # Adiciona timestamp
+            event_data['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Filtra apenas eventos relevantes
+            if 'Code' in event_data and 'Face' in event_data['Code']:
+                return event_data
+            return None
+        except Exception:
+            return None
+
+    def get_logs(self, limit=50):
+        """Retorna os últimos logs de detecção facial."""
+        with self.lock:
+            logs_list = list(self.logs)
+            # Retorna os mais recentes primeiro
+            return logs_list[-limit:][::-1]
+
+    def stop(self):
+        """Para o listener."""
+        self.stop_flag = True
 
 # ==========================
 # Captura por canal (thread)
@@ -67,6 +153,10 @@ class CaptureThread(threading.Thread):
                 except: pass
             self.cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # Verifica se realmente abriu
+            if not self.cap.isOpened():
+                self.cap.release()
+                self.cap = None
         except Exception:
             self.cap = None
 
@@ -78,7 +168,19 @@ class CaptureThread(threading.Thread):
         self._open()
         last_try = 0
         while not self.stop_flag:
-            ok, frame = (self.cap.read() if self.cap is not None else (False, None))
+            # Verifica se cap está válido antes de tentar ler
+            ok, frame = False, None
+            if self.cap is not None and self.cap.isOpened():
+                try:
+                    ok, frame = self.cap.read()
+                except Exception:
+                    # Se der erro ao ler, marca como falha
+                    ok, frame = False, None
+                    # Invalida o cap para forçar reconexão
+                    try: self.cap.release()
+                    except: pass
+                    self.cap = None
+
             if not ok or frame is None:
                 if time.time() - last_try >= self.reconnect_delay_s:
                     self._open()
@@ -115,8 +217,9 @@ class StreamState:
         self.lock = threading.RLock()
         self.threads: Dict[int, CaptureThread] = {}
         self.getters: Dict[int, callable] = {}
+        self.face_listener: FaceDetectionListener = None
         self.config = {
-            "ip": "192.168.0.18",
+            "ip": "192.168.0.10",
             "user": "admin",
             "password": "arenna@123",
             "channels": (1, 2),
@@ -140,13 +243,22 @@ class StreamState:
                 "target_height": target_height
             })
 
-            # inicia novos
+            # inicia novos streams
             for ch in channels:
                 url = make_rtsp_url(ip, user, password, ch, subtype)
                 t = CaptureThread(name=f"CH{ch}", url=url, label=f"CH{ch}", target_h=target_height)
                 t.start()
                 self.threads[ch] = t
                 self.getters[ch] = t.get_frame
+
+            # inicia listener de detecção facial
+            if self.face_listener is not None:
+                try:
+                    self.face_listener.stop()
+                except:
+                    pass
+            self.face_listener = FaceDetectionListener(ip, user, password)
+            self.face_listener.start()
 
     def stop_all(self):
         with self.lock:
@@ -155,6 +267,9 @@ class StreamState:
     def stop_all_locked(self):
         for t in list(self.threads.values()):
             try: t.stop()
+            except: pass
+        if self.face_listener is not None:
+            try: self.face_listener.stop()
             except: pass
 
 STATE = StreamState()
@@ -264,7 +379,7 @@ INDEX_HTML = """
         <div class="row">
           <div class="col">
             <label>IP do DVR</label>
-            <input name="ip" value="{{ ip }}" placeholder="192.168.0.18" required>
+            <input name="ip" value="{{ ip }}" placeholder="192.168.0.10" required>
           </div>
           <div class="col">
             <label>Usuário</label>
@@ -332,7 +447,52 @@ VIEW_HTML = """
     .card{background:#13151b;border:1px solid #1e2230;border-radius:12px;padding:12px}
     img{max-width:100%;height:auto;border-radius:8px;border:1px solid #2a2f40}
     .muted{color:#a0a5b0;font-size:14px}
+    .log-container{max-height:400px;overflow-y:auto;margin-top:12px}
+    .log-entry{background:#1a1d28;padding:10px;margin-bottom:8px;border-radius:6px;border-left:3px solid #2563eb}
+    .log-time{color:#60a5fa;font-weight:600;font-size:13px}
+    .log-details{margin-top:6px;font-size:13px;color:#d1d5db}
+    .status-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;margin-left:8px}
+    .status-connected{background:#10b981;color:#fff}
+    .status-disconnected{background:#ef4444;color:#fff}
   </style>
+  <script>
+    // Auto-refresh dos logs a cada 3 segundos
+    function refreshLogs() {
+      fetch('/api/face-logs')
+        .then(response => response.json())
+        .then(data => {
+          const container = document.getElementById('logs-container');
+          if (data.logs && data.logs.length > 0) {
+            container.innerHTML = data.logs.map(log => {
+              const details = Object.entries(log)
+                .filter(([key]) => key !== 'timestamp')
+                .map(([key, value]) => `<span>${key}: ${value}</span>`)
+                .join(' • ');
+              return `
+                <div class="log-entry">
+                  <div class="log-time">${log.timestamp || 'N/A'}</div>
+                  <div class="log-details">${details}</div>
+                </div>
+              `;
+            }).join('');
+          } else {
+            container.innerHTML = '<div class="muted" style="text-align:center;padding:20px">Aguardando eventos de detecção facial...</div>';
+          }
+
+          // Atualiza status da conexão
+          const statusEl = document.getElementById('listener-status');
+          statusEl.className = 'status-badge ' + (data.connected ? 'status-connected' : 'status-disconnected');
+          statusEl.textContent = data.connected ? 'Conectado' : 'Desconectado';
+        })
+        .catch(err => console.error('Erro ao buscar logs:', err));
+    }
+
+    // Carrega logs ao abrir a página e atualiza periodicamente
+    window.addEventListener('load', () => {
+      refreshLogs();
+      setInterval(refreshLogs, 3000);
+    });
+  </script>
 </head>
 <body>
   <header><h1>ARENNA</h1></header>
@@ -360,6 +520,16 @@ VIEW_HTML = """
         <img src="{{ url_for('mosaic_mjpg', mode='grid', cols=4, subset='all') }}">
       </div>
     {% endif %}
+
+    <h3 style="margin-top:22px">
+      Logs de Detecção Facial
+      <span id="listener-status" class="status-badge status-disconnected">Desconectado</span>
+    </h3>
+    <div class="card">
+      <div class="log-container" id="logs-container">
+        <div class="muted" style="text-align:center;padding:20px">Carregando logs...</div>
+      </div>
+    </div>
 
     <h3 style="margin-top:22px">Câmeras individuais</h3>
     <div class="grid">
@@ -437,11 +607,27 @@ def mosaic_mjpg():
 
     return Response(mjpeg_generator(getter), mimetype="multipart/x-mixed-replace; boundary=frame")
 
+@app.route("/api/face-logs")
+def api_face_logs():
+    """API para retornar logs de detecção facial em JSON."""
+    logs = []
+    connected = False
+
+    if STATE.face_listener is not None:
+        logs = STATE.face_listener.get_logs(limit=50)
+        connected = STATE.face_listener.connected
+
+    return jsonify({
+        "logs": logs,
+        "connected": connected,
+        "count": len(logs)
+    })
+
 # ==========================
 # Main
 # ==========================
 def main(
-    default_ip="192.168.0.18",
+    default_ip="192.168.0.10",
     default_user="admin",
     default_password="arenna@123",
     default_channels=(1, 2),
@@ -467,9 +653,9 @@ def main(
 if __name__ == "__main__":
     # Ajuste os defaults se quiser; o resto é configurado pela página inicial.
     main(
-        default_ip="192.168.0.18",
+        default_ip="192.168.0.10",
         default_user="admin",
-        default_password="arenna@123",
+        default_password="nav@2025",
         default_channels=(1, 2),  # ou (1,) ... até (1,2,...,16)
         default_subtype=0,        # 0=main (HD), 1=sub (leve)
         default_target_height=360,
